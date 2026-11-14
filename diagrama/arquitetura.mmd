@@ -1,0 +1,33 @@
+%% Arquitetura em camadas: modules -> environments -> AWS
+%% Render: npx -y @mermaid-js/mermaid-cli -i arquitetura.mmd -o arquitetura.png
+flowchart LR
+    subgraph MODULES["modules/ — blocos reutilizáveis (versões em faixa)"]
+        MN["network<br/>VPC · subnets · NAT · flow logs"]
+        MK["kubernetes<br/>EKS · node groups · access entries"]
+        MO["observability<br/>Prometheus · Grafana · exporters"]
+    end
+
+    subgraph ENVS["environments/ — composição (versões fixas, 1 state cada)"]
+        EP["production<br/>key: producao/infra.tfstate"]
+        EO["production-observability<br/>key: producao/observability.tfstate"]
+    end
+
+    subgraph AWS["AWS"]
+        VPC["VPC — 3 AZ<br/>subnets privadas e públicas · NAT"]
+        EKS["EKS<br/>node group 2..4 nós"]
+        STACK["Stack de monitoramento<br/>namespace monitoring"]
+        S3["S3<br/>state + lock nativo"]
+    end
+
+    MN --> EP
+    MK --> EP
+    MO --> EO
+
+    EP --> VPC
+    EP --> EKS
+    EO --> STACK
+    STACK -.->|roda dentro| EKS
+    EO -.->|"lê o cluster<br/>(data source)"| EKS
+
+    EP --> S3
+    EO --> S3

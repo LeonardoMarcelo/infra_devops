@@ -1,0 +1,92 @@
+name: Validate
+
+# Feedback rápido nas branches de trabalho do gitflow, SEM credenciais da AWS.
+# Pega erro de sintaxe, de formatação e argumento inválido de módulo em
+# segundos, e nenhum secret é exposto a uma branch que ninguém revisou ainda.
+#
+# Valida cada módulo ISOLADAMENTE, além da composição. Um módulo que só
+# valida quando chamado pelo ambiente não é reaproveitável de verdade.
+
+on:
+  push:
+    branches:
+      - "feature/**"
+      - "bugfix/**"
+      - "release/**"
+      - "hotfix/**"
+    paths:
+      - "environments/**"
+      - "modules/**"
+      - ".github/workflows/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: validate-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  TF_VERSION: "1.17.2"
+
+jobs:
+  # =========================================================================
+  # ETAPA 1 — Formatação de todo o repositório
+  # =========================================================================
+  format:
+    name: Formatação
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Instalar o Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Verificar a formatação
+        # -recursive cobre modules/ e environments/ de uma vez.
+        # Diretórios ocultos (como .terraform) são ignorados pelo fmt.
+        run: terraform fmt -check -diff -recursive
+
+  # =========================================================================
+  # ETAPA 2 — Sintaxe de cada módulo e de cada ambiente
+  # =========================================================================
+  validate:
+    name: Validate ${{ matrix.directory }}
+    runs-on: ubuntu-latest
+    strategy:
+      # Não para no primeiro erro: é mais útil ver todos os diretórios
+      # quebrados de uma vez do que descobrir um por execução.
+      fail-fast: false
+      matrix:
+        directory:
+          - modules/network
+          - modules/kubernetes
+          - modules/database
+          - modules/observability
+          - environments/production
+          - environments/production-data
+          - environments/production-observability
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Instalar o Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Init sem backend
+        working-directory: ${{ matrix.directory }}
+        # -backend=false baixa módulos e providers para validar, mas não toca
+        # no state remoto e não exige credencial nenhuma.
+        run: terraform init -backend=false -input=false
+
+      - name: Validate
+        working-directory: ${{ matrix.directory }}
+        run: terraform validate -no-color
