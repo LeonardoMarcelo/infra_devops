@@ -1,0 +1,122 @@
+name: Destroy
+
+# Destruição manual, fora do gitflow de propósito: destruir não é um "deploy"
+# e não deve ser alcançável por merge nenhum.
+#
+# Três barreiras antes de qualquer recurso ser removido:
+#   1. workflow_dispatch apenas (nunca por push).
+#   2. É preciso digitar o nome do cluster; o job `guard` confere contra o
+#      terraform.tfvars antes de qualquer credencial ser carregada.
+#   3. O Environment "production" exige aprovação manual.
+#
+# O único dado controlado por quem dispara (`inputs.confirm`) é passado por
+# `env:` e lido como "$CONFIRM" — nunca interpolado direto no shell.
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: "Digite o nome do cluster (cluster_name) para confirmar"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+# Mesmo grupo de terraform.yml: um destroy nunca roda junto com um apply.
+# A string tem de bater exatamente com o `working-directory` usado lá.
+concurrency:
+  group: terraform-./environments/production
+  cancel-in-progress: false
+
+env:
+  TF_VERSION: "1.17.2"
+  WORKDIR: ./environments/production
+
+jobs:
+  guard:
+    name: Confirmação
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Conferir o nome digitado
+        working-directory: ${{ env.WORKDIR }}
+        env:
+          CONFIRM: ${{ inputs.confirm }}
+        run: |
+          expected=$(grep -E '^[[:space:]]*cluster_name[[:space:]]*=' terraform.tfvars \
+            | head -1 | sed -E 's/.*=[[:space:]]*"([^"]*)".*/\1/')
+          if [ -z "$expected" ]; then
+            echo "::error::Não foi possível ler cluster_name de terraform.tfvars."
+            exit 1
+          fi
+          if [ "$CONFIRM" != "$expected" ]; then
+            echo "::error::Confirmação não corresponde ao cluster configurado. Destroy cancelado."
+            exit 1
+          fi
+          echo "Confirmado: $expected" >> "$GITHUB_STEP_SUMMARY"
+
+  destroy:
+    name: Destroy
+    needs: guard
+    runs-on: ubuntu-latest
+    # Segunda barreira humana: aprovação exigida pelo Environment.
+    environment: production
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Instalar o Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      # Mesmo esquema de terraform.yml: a variável AWS_ROLE_ARN decide o modo.
+      - name: Credenciais da AWS (OIDC)
+        if: vars.AWS_ROLE_ARN != ''
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: us-east-1
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          role-session-name: terraform-destroy-${{ github.run_id }}
+
+      - name: Credenciais da AWS (chave estática — legado)
+        if: vars.AWS_ROLE_ARN == ''
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: us-east-1
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+
+      - name: Init
+        working-directory: ${{ env.WORKDIR }}
+        env:
+          BACKEND_BUCKET: ${{ secrets.AWS_BUCKET_NAME }}
+          BACKEND_KEY: ${{ secrets.AWS_BUCKET_FILE }}
+        run: |
+          terraform init -input=false \
+            -backend-config="bucket=$BACKEND_BUCKET" \
+            -backend-config="key=$BACKEND_KEY" \
+            -backend-config="region=us-east-1"
+
+      - name: Planejar a destruição
+        working-directory: ${{ env.WORKDIR }}
+        run: |
+          set -o pipefail
+          terraform plan -destroy -input=false -no-color -lock-timeout=5m \
+            -out=tfdestroy 2>&1 | tee destroy.txt
+          {
+            echo "### Terraform Destroy"
+            echo '```terraform'
+            tail -c 60000 destroy.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Destroy
+        working-directory: ${{ env.WORKDIR }}
+        # Aplica o plano de destruição que acabou de ser registrado no resumo.
+        run: terraform apply -input=false -no-color -lock-timeout=5m tfdestroy

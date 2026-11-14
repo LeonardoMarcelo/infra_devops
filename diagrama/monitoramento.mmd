@@ -1,0 +1,35 @@
+%% Monitoramento: os três caminhos de alvo até o Prometheus
+%% Render: npx -y @mermaid-js/mermaid-cli -i monitoramento.mmd -o monitoramento.png
+flowchart LR
+    subgraph ALVOS["Alvos — declarados no terraform.tfvars"]
+        A1["API COM /metrics<br/>instrumentada"]
+        A2["QUALQUER URL HTTP<br/>API sua, legada ou de terceiro"]
+        A3["BANCO DE DADOS<br/>RDS · ElastiCache · no cluster"]
+    end
+
+    subgraph COLETA["Coleta — namespace monitoring"]
+        SM["ServiceMonitor"]
+        BB["blackbox-exporter<br/>sonda de fora"]
+        EX["exporter por engine<br/>postgres · mysql · redis · mongodb"]
+        PROM["Prometheus<br/>retenção 15d"]
+    end
+
+    subgraph SAIDA["Consumo"]
+        GRAF["Grafana<br/>dashboards"]
+        ALERT["Alertmanager"]
+        NOTIF["Slack · e-mail · PagerDuty"]
+    end
+
+    A1 -->|api_targets| SM
+    A2 -->|http_probes| BB
+    A3 -->|database_targets| EX
+
+    SM --> PROM
+    BB --> PROM
+    EX --> PROM
+
+    PROM --> GRAF
+    PROM --> ALERT
+    ALERT --> NOTIF
+
+    SEC["Secret do Kubernetes<br/>credencial nunca vai no tfvars"] -.-> EX

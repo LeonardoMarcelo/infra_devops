@@ -1,0 +1,80 @@
+name: GitFlow
+
+# Mapa do gitflow para o Terraform. Este arquivo só decide QUANDO e COM QUAL
+# intenção rodar; o COMO está em terraform.yml.
+#
+#   feature/* , bugfix/*     push  -> validate.yml (fmt + validate, sem AWS)
+#   PR -> develop                  -> plan (comentado no PR)
+#   merge em develop               -> plan (confirma o estado de integração)
+#   release/* , hotfix/*     push  -> validate.yml
+#   PR -> main                     -> plan (é a revisão do que vai a produção)
+#   merge em main                  -> plan + apply, com aprovação manual
+#
+# Como só existe um cluster (ambientes separados por namespace, conforme o
+# requisito), develop nunca aplica: ela valida contra o state real sem mudá-lo.
+#
+# Este workflow não executa nenhum `run:`: ele apenas chama o reutilizável,
+# então não há superfície para injeção de comando via dados do evento.
+
+on:
+  pull_request:
+    branches: [develop, main]
+    paths:
+      - "environments/**"
+      - "modules/**"
+      - ".github/workflows/**"
+  push:
+    branches: [develop, main]
+    paths:
+      - "environments/**"
+      - "modules/**"
+      - ".github/workflows/**"
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "O que executar manualmente"
+        type: choice
+        options: [plan, apply]
+        default: plan
+
+permissions:
+  contents: read
+  pull-requests: write
+  # As permissões do chamador limitam as do workflow chamado: sem id-token
+  # aqui, o OIDC não funciona lá dentro.
+  id-token: write
+
+jobs:
+  # PRs para develop/main e merges em develop: apenas planejar.
+  plan:
+    name: Plan
+    if: >-
+      github.event_name == 'pull_request'
+      || (github.event_name == 'push' && github.ref == 'refs/heads/develop')
+      || (github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'plan')
+    uses: ./.github/workflows/terraform.yml
+    with:
+      action: plan
+      # Variável do repositório (Settings > Variables), não secret: o ARN da
+      # role não é segredo. Definir ativa o OIDC; deixar vazia mantém o modo
+      # legado com chave estática. A migração é só criar a variável.
+      aws-role-arn: ${{ vars.AWS_ROLE_ARN }}
+      # O bucket de state está em outra região que os recursos.
+      backend-region: ${{ vars.AWS_BACKEND_REGION }}
+    secrets: inherit
+
+  # Merge de release/* ou hotfix/* em main: planejar e aplicar, com o gate de
+  # aprovação do Environment "production" no meio.
+  apply:
+    name: Apply (produção)
+    if: >-
+      (github.event_name == 'push' && github.ref == 'refs/heads/main')
+      || (github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'apply')
+    uses: ./.github/workflows/terraform.yml
+    with:
+      action: apply
+      environment: production
+      aws-role-arn: ${{ vars.AWS_ROLE_ARN }}
+      # O bucket de state está em outra região que os recursos.
+      backend-region: ${{ vars.AWS_BACKEND_REGION }}
+    secrets: inherit
