@@ -1,0 +1,282 @@
+name: Terraform
+
+# Workflow reutilizável: concentra todo o "como" executar o Terraform.
+# Os workflows de gitflow apenas o chamam com parâmetros diferentes, então a
+# lógica vive em um único lugar e serve a qualquer cenário (outro diretório,
+# outra região, outro ambiente).
+#
+# Nota de segurança: nenhum valor de `github.event.*` (título de PR, mensagem
+# de commit, nome de branch) entra em um `run:`. Tudo que é interpolado em
+# shell passa por `env:` e é lido como "$VAR", o que impede injeção de comando.
+
+on:
+  workflow_call:
+    inputs:
+      action:
+        description: "plan = somente planeja | apply = planeja e aplica"
+        type: string
+        required: true
+      environment:
+        description: >-
+          GitHub Environment usado no apply. É nele que se configura o gate de
+          aprovação manual e os secrets específicos do ambiente.
+        type: string
+        default: ""
+      working-directory:
+        description: >-
+          Diretório raiz da configuração Terraform. Troque este parâmetro para
+          reusar o mesmo motor em outro ambiente (environments/staging, etc.).
+        type: string
+        default: ./environments/production
+      terraform-version:
+        description: "Versão exata do Terraform, para CI e máquina local baterem"
+        type: string
+        default: "1.17.2"
+      aws-region:
+        type: string
+        default: us-east-1
+      backend-region:
+        description: >-
+          Região do bucket de state. Vazio = mesma de `aws-region`.
+          O state NÃO precisa ficar na mesma região dos recursos — mantê-lo
+          em outra é inclusive uma proteção: falha de uma região não leva
+          junto o registro do que existe na outra.
+        type: string
+        default: ""
+      aws-role-arn:
+        description: >-
+          ARN da role assumida via OIDC. Quando preenchido, NENHUMA chave
+          estática é usada: o GitHub emite um token de curta duração e a AWS
+          o troca por credencial temporária. Vazio = modo legado com chave.
+        type: string
+        default: ""
+    secrets:
+      # Opcionais: só são usados no modo legado (sem aws-role-arn).
+      AWS_ACCESS_KEY_ID:
+        required: false
+      AWS_SECRET_ACCESS_KEY:
+        required: false
+      AWS_BUCKET_NAME:
+        required: true
+      AWS_BUCKET_FILE:
+        required: true
+
+permissions:
+  contents: read
+  pull-requests: write
+  # Necessário para o GitHub emitir o token OIDC. Sem isto, o
+  # configure-aws-credentials falha com "Credentials could not be loaded".
+  id-token: write
+
+# Um state, uma execução por vez. Sem isso, dois merges próximos disputam o
+# mesmo state no S3. `cancel-in-progress: false` é deliberado: cancelar um
+# apply pela metade é pior do que esperar na fila.
+concurrency:
+  group: terraform-${{ inputs.working-directory }}
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    name: Plan
+    runs-on: ubuntu-latest
+    env:
+      # Necessário para os `terraform_remote_state` que ligam as camadas
+      # (dados lê a base; observabilidade lê os dados). Variável de entrada
+      # do Terraform, não do shell — por isso o prefixo TF_VAR_.
+      TF_VAR_state_bucket: ${{ secrets.AWS_BUCKET_NAME }}
+    outputs:
+      # 0 = sem mudanças, 2 = há mudanças. Usado para não abrir o gate de
+      # aprovação quando não existe nada a aplicar.
+      exitcode: ${{ steps.plan.outputs.exitcode }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Instalar o Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ inputs.terraform-version }}
+          terraform_wrapper: false
+
+      - name: Verificar a formatação
+        working-directory: ${{ inputs.working-directory }}
+        run: terraform fmt -check -diff
+
+      # Dois passos excludentes: o `if` escolhe o modo de autenticação.
+      # Preencher a variável AWS_ROLE_ARN no repositório ativa o OIDC e
+      # desativa a chave estática — sem editar workflow nenhum.
+      - name: Credenciais da AWS (OIDC)
+        if: inputs.aws-role-arn != ''
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ inputs.aws-region }}
+          role-to-assume: ${{ inputs.aws-role-arn }}
+          role-session-name: terraform-${{ github.run_id }}
+
+      - name: Credenciais da AWS (chave estática — legado)
+        if: inputs.aws-role-arn == ''
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ inputs.aws-region }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+
+      - name: Init
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          BACKEND_BUCKET: ${{ secrets.AWS_BUCKET_NAME }}
+          BACKEND_KEY: ${{ secrets.AWS_BUCKET_FILE }}
+          BACKEND_REGION: ${{ inputs.backend-region || inputs.aws-region }}
+        run: |
+          terraform init -input=false \
+            -backend-config="bucket=$BACKEND_BUCKET" \
+            -backend-config="key=$BACKEND_KEY" \
+            -backend-config="region=$BACKEND_REGION"
+
+      - name: Validate
+        working-directory: ${{ inputs.working-directory }}
+        run: terraform validate -no-color
+
+      - name: Plan
+        id: plan
+        working-directory: ${{ inputs.working-directory }}
+        run: |
+          set -o pipefail +e
+          terraform plan -input=false -no-color -lock-timeout=5m \
+            -detailed-exitcode -out=tfplan 2>&1 | tee plan.txt
+          code=${PIPESTATUS[0]}
+          echo "exitcode=$code" >> "$GITHUB_OUTPUT"
+          # 1 é erro de verdade; 0 (sem mudanças) e 2 (com mudanças) são
+          # resultados válidos e seguem o fluxo.
+          if [ "$code" -eq 1 ]; then exit 1; fi
+
+      - name: Publicar o resumo do plano
+        if: always()
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          CODE: ${{ steps.plan.outputs.exitcode }}
+          DIR: ${{ inputs.working-directory }}
+        run: |
+          {
+            echo "### Terraform Plan — \`$DIR\`"
+            case "$CODE" in
+              0) echo "Nenhuma mudança: a infraestrutura já está sincronizada com o código." ;;
+              2) echo "Há mudanças a aplicar." ;;
+              *) echo "O plan falhou." ;;
+            esac
+            echo
+            echo "<details><summary>Saída completa</summary>"
+            echo
+            echo '```terraform'
+            tail -c 60000 plan.txt 2>/dev/null || echo "(plan não gerado)"
+            echo '```'
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Comentar o plano no Pull Request
+        if: always() && github.event_name == 'pull_request'
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          CODE: ${{ steps.plan.outputs.exitcode }}
+        run: |
+          case "$CODE" in
+            0) status="sem mudanças" ;;
+            2) status="há mudanças" ;;
+            *) status="falhou" ;;
+          esac
+          {
+            echo "## Terraform Plan"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Commit | \`${GITHUB_SHA:0:7}\` |"
+            echo "| Resultado | $status |"
+            echo
+            echo '```terraform'
+            tail -c 50000 plan.txt 2>/dev/null || echo "(plan não gerado)"
+            echo '```'
+          } > comment.md
+          # Edita o comentário anterior em vez de empilhar um novo por push.
+          gh pr comment "$PR_NUMBER" --body-file comment.md --edit-last \
+            || gh pr comment "$PR_NUMBER" --body-file comment.md
+
+      - name: Guardar o plano aprovado
+        # Só no caminho de apply: é este arquivo exato que será aplicado,
+        # garantindo que nada mude entre o que foi revisado e o que roda.
+        if: inputs.action == 'apply' && steps.plan.outputs.exitcode == '2'
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-${{ github.sha }}
+          path: ${{ inputs.working-directory }}/tfplan
+          # O plano contém valores resolvidos. Retenção mínima, de propósito.
+          retention-days: 1
+          if-no-files-found: error
+
+  apply:
+    name: Apply
+    needs: plan
+    # Não abre o gate de aprovação se o plan não encontrou mudanças.
+    if: inputs.action == 'apply' && needs.plan.outputs.exitcode == '2'
+    runs-on: ubuntu-latest
+    env:
+      # Necessário para os `terraform_remote_state` que ligam as camadas
+      # (dados lê a base; observabilidade lê os dados). Variável de entrada
+      # do Terraform, não do shell — por isso o prefixo TF_VAR_.
+      TF_VAR_state_bucket: ${{ secrets.AWS_BUCKET_NAME }}
+    # O gate: a aprovação manual configurada neste Environment acontece aqui,
+    # entre o plan revisado e o apply.
+    environment: ${{ inputs.environment }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Instalar o Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ inputs.terraform-version }}
+          terraform_wrapper: false
+
+      # Dois passos excludentes: o `if` escolhe o modo de autenticação.
+      # Preencher a variável AWS_ROLE_ARN no repositório ativa o OIDC e
+      # desativa a chave estática — sem editar workflow nenhum.
+      - name: Credenciais da AWS (OIDC)
+        if: inputs.aws-role-arn != ''
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ inputs.aws-region }}
+          role-to-assume: ${{ inputs.aws-role-arn }}
+          role-session-name: terraform-${{ github.run_id }}
+
+      - name: Credenciais da AWS (chave estática — legado)
+        if: inputs.aws-role-arn == ''
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ inputs.aws-region }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+
+      - name: Init
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          BACKEND_BUCKET: ${{ secrets.AWS_BUCKET_NAME }}
+          BACKEND_KEY: ${{ secrets.AWS_BUCKET_FILE }}
+          BACKEND_REGION: ${{ inputs.backend-region || inputs.aws-region }}
+        run: |
+          terraform init -input=false \
+            -backend-config="bucket=$BACKEND_BUCKET" \
+            -backend-config="key=$BACKEND_KEY" \
+            -backend-config="region=$BACKEND_REGION"
+
+      - name: Recuperar o plano aprovado
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan-${{ github.sha }}
+          path: ${{ inputs.working-directory }}
+
+      - name: Apply
+        working-directory: ${{ inputs.working-directory }}
+        # Aplica o plano salvo, não um replan. Um plano salvo já está
+        # aprovado, por isso -auto-approve não é passado aqui.
+        run: terraform apply -input=false -no-color -lock-timeout=5m tfplan

@@ -1,0 +1,75 @@
+# ---------------------------------------------------------------------------
+# Terraform
+# ---------------------------------------------------------------------------
+
+# Diretório de trabalho local: providers e módulos baixados (centenas de MB).
+# Reconstruído por `terraform init`, nunca versionado.
+**/.terraform/*
+
+# Arquivos de state. O state deste projeto vive no backend S3.
+# Qualquer state local é resíduo de execução e pode conter dados sensíveis.
+*.tfstate
+*.tfstate.*
+.terraform.tfstate.lock.info
+
+# Planos salvos (`terraform plan -out=...`). Contêm valores resolvidos,
+# incluindo os sensíveis.
+*.tfplan
+tfplan
+tfplan.txt
+
+# Logs de crash do Terraform (podem conter trechos do state).
+crash.log
+crash.*.log
+
+# Arquivos de override, usados para ajustes locais que não devem subir.
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# Configuração de CLI local (pode conter credenciais de registry).
+.terraformrc
+terraform.rc
+
+# Variáveis geradas ou locais.
+# ATENÇÃO: `*.tfvars` NÃO está ignorado de propósito. Neste projeto o
+# terraform.tfvars é a configuração declarada do ambiente e contém apenas
+# valores não sensíveis (região, CIDRs, nome do cluster, tags). Os valores
+# sensíveis ficam nos secrets do GitHub Actions.
+*.tfvars.json
+*.auto.tfvars
+*.auto.tfvars.json
+
+# O lock de providers DEVE ser versionado: é ele que garante que CI e
+# máquina local resolvam exatamente as mesmas versões.
+!.terraform.lock.hcl
+
+# ...mas só o da RAIZ (environments/*). Lock dentro de um módulo reutilizável
+# é ignorado por quem consome o módulo; ele aparece apenas como resíduo de um
+# `terraform init` rodado ali para validar sintaxe.
+modules/*/.terraform.lock.hcl
+
+# ---------------------------------------------------------------------------
+# Credenciais e segredos
+# ---------------------------------------------------------------------------
+.env
+.env.*
+*.pem
+*.key
+.aws/
+kubeconfig
+kubeconfig.yaml
+
+# ---------------------------------------------------------------------------
+# Sistema operacional e editores
+# ---------------------------------------------------------------------------
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*~
+
+
+resumido.md

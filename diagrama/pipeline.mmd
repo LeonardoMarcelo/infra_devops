@@ -1,0 +1,26 @@
+%% Pipeline em gitflow: o que roda em cada evento
+%% Render: npx -y @mermaid-js/mermaid-cli -i pipeline.mmd -o pipeline.png
+flowchart TD
+    DEV["Dev"] -->|push| FEAT["feature/* · bugfix/*"]
+
+    FEAT -->|push| VAL["validate.yml<br/>fmt + validate<br/>SEM credencial AWS"]
+    FEAT -->|Pull Request| DEVELOP["develop"]
+
+    DEVELOP -->|"PR e merge"| PLAN1["gitflow.yml → terraform.yml<br/>PLAN<br/>comentado no PR"]
+    PLAN1 -.->|nunca aplica| NOOP["develop não altera infraestrutura"]
+
+    DEVELOP --> REL["release/* · hotfix/*"]
+    REL -->|push| VAL
+    REL -->|Pull Request| MAIN["main"]
+
+    MAIN -->|no PR| PLAN2["PLAN<br/>é esta a revisão do que vai a produção"]
+    MAIN -->|após o merge| PLAN3["PLAN<br/>plano salvo como artefato"]
+
+    PLAN3 --> GATE{"Environment production<br/>aprovação manual"}
+    GATE -->|aprovado| APPLY["APPLY do plano salvo<br/>não é replan"]
+    GATE -->|sem mudança| SKIP["Não abre o gate"]
+
+    APPLY --> CLOUD["AWS"]
+
+    MANUAL["workflow_dispatch"] --> DESTROY["destroy.yaml<br/>1. digitar o nome do cluster<br/>2. aprovação do Environment"]
+    DESTROY --> CLOUD
